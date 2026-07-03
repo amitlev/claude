@@ -9,7 +9,7 @@ description: Build a live Cowork artifact that scans someone's connected Gmail f
 
 A self-contained Cowork live artifact: a filterable board of unread Gmail threads that need something from the user, grouped into Meetings & Scheduling / Applications / Forms & Questionnaires / Other Actions. Each card links to the real thread in Gmail and has a "Mark as read" button; there's also a bulk "Mark all as read" for the current filter. Everything not actionable (newsletters, job-alert digests, receipts, automated notices) is filtered out by an AI triage pass, so what's left is short and worth looking at.
 
-This came out of building the same thing for one user by hand and hitting two real bugs along the way — both are called out below because they'll bite you again if skipped.
+This came out of building the same thing for one user by hand and hitting several real bugs along the way — each is called out below because it'll bite you again if skipped.
 
 ## Step 1: Confirm Gmail is connected, and find the real tool names
 
@@ -24,7 +24,7 @@ Every Cowork install has its own connector instances, so the exact tool names lo
 Ask at most two short multiple-choice questions so this stays fast:
 
 - What should count as "actionable"? Default to the four categories above, but let them narrow it (e.g. only job-related, or organize by Gmail label instead).
-- Time scope: unread-only (no time limit) is a good default; offer "last N days" as an alternative for people with huge unread counts.
+- Time scope: default to **unread from the last 7 days**, not unlimited unread. An all-time `is:unread` query sounds more thorough, but for anyone with a neglected inbox it can mean hundreds of threads, which pushes the AI triage pass past reasonable load times (this genuinely happened — see the timeout bug below). 7 days is fast and covers the overwhelming majority of "what did I miss recently." Offer to widen it if they ask for more history and are fine with a slower load.
 
 Don't over-ask. The goal is a working artifact in one pass, not a requirements document.
 
@@ -50,9 +50,19 @@ Gmail's thread-search API returns a short snippet (~200 characters), not the ful
 
 The template already handles this with a second pass: after the first classification round, anything Gmail marked Important, or that comes from an official/government-looking sender, or whose snippet/subject contains action-hinting keywords (see `IMPORTANT_SENDER_RE` / `KEYWORD_RE` near the top of the script), but which the first pass called non-actionable, gets its full body fetched once via the thread-detail tool and reclassified. Keep this pass — it's there because the naive version genuinely missed real, important emails.
 
-### The other bug that will bite you: dead references after renaming
+### The bug that will bite you: dead references after renaming
 
 If you rename or restructure any JS function while customizing the template, grep the whole file for the old name afterward. A stray `window.oldName = oldName;` left over from a rename throws a `ReferenceError` the instant the script runs, which silently kills the entire page before it ever calls its own init function — the artifact will just look permanently empty, with no error shown to the user. This exact bug happened once already; it's an easy one to reintroduce.
+
+### The bug that will bite you: a "stuck" spinner with no feedback
+
+Every `callMcpTool` and `askClaude` call in the template is wrapped in `withTimeout(promise, ms, label)`. Without this, a single slow AI response or network call leaves the page on the loading spinner indefinitely — from the user's side this is indistinguishable from "broken," because there's no error and no progress. Two things fix this together: the timeout wrapper (so a hang becomes a real error after N seconds instead of never resolving), and `setLoadingText()` calls at each stage so the spinner's message actually changes as work happens ("Fetching unread emails…" → "Triaging N emails…" → "Double-checking…"). If you add new async steps, wrap them and update the loading text the same way — don't let any external call sit un-timed.
+
+### The bug that will bite you: robustness fixes that silently drop data
+
+The first fix for "stuck spinner" was to catch failures per-batch so one slow AI call couldn't crash the whole page. That's correct, but the first version of it defaulted a failed batch to "not actionable" — which fixed the crash but introduced something worse: emails whose classification call failed just vanished from the tracker with zero indication anything went wrong. It looked like "the tracker is missing emails again" with no error anywhere, because there wasn't one.
+
+The template's actual behavior: when a triage or full-body-recheck call fails (timeout, error, whatever), the affected email is explicitly surfaced under "Other Actions" with a summary like "Couldn't auto-triage — check manually," instead of being marked not-actionable by default. The general principle, worth keeping whenever you touch this: **when you can't tell if something is actionable, show it — don't silently guess "no."** A false positive costs the user one glance at a card; a silent false negative costs them a missed action item and they won't even know to look.
 
 ## Step 5: Publish
 
