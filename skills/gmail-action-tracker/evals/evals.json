@@ -1,0 +1,17 @@
+{
+  "skill_name": "gmail-action-tracker",
+  "evals": [
+    {
+      "id": 0,
+      "prompt": "Build me a live tracker for unread Gmail emails that need action from me",
+      "expected_output": "A Cowork live artifact (HTML) that scans unread Gmail via the correct, freshly-discovered connector tool names, uses AI triage to keep only emails needing action, groups into categories, and lets the user mark items read (individually and in bulk) as a real Gmail action.",
+      "files": []
+    },
+    {
+      "id": 1,
+      "prompt": "I keep missing important stuff in my inbox, especially official emails where the actual ask is buried further down past the preview text. Can you make me a live dashboard that only shows unread emails that genuinely need something from me, and let me mark them handled without leaving the page?",
+      "expected_output": "Same artifact, but should specifically demonstrate the snippet-truncation second-pass (re-checking important/official-looking emails against full body) and a working mark-as-read action inline in the UI, since the user explicitly called out both of these needs without naming them technically.",
+      "files": []
+    }
+  ]
+}

@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: #f7f7f5;
+    color: #1f1f1f;
+    padding: 20px 24px 40px;
+  }
+  .top {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+  h1 { font-size: 19px; font-weight: 600; margin: 0; }
+  .sub { font-size: 13px; color: #6b6b6b; }
+
+  .toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+  .mark-all {
+    font-size: 12.5px;
+    padding: 7px 14px;
+    border-radius: 20px;
+    border: 1px solid #1f1f1f;
+    background: #1f1f1f;
+    color: #fff;
+    cursor: pointer;
+    font-family: inherit;
+    white-space: nowrap;
+  }
+  .mark-all:disabled { background: #d8d5cf; border-color: #d8d5cf; color: #8a8a8a; cursor: default; }
+  .tab {
+    border: 1px solid #ddd9d2;
+    background: #fff;
+    border-radius: 20px;
+    padding: 6px 14px;
+    font-size: 12.5px;
+    cursor: pointer;
+    color: #444;
+    user-select: none;
+  }
+  .tab.active { background: #2a2a28; color: #fff; border-color: #2a2a28; }
+
+  .board {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 12px;
+  }
+  .card {
+    background: #fff;
+    border: 1px solid #e7e5e1;
+    border-radius: 12px;
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .card .badge {
+    align-self: flex-start;
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: .03em;
+    text-transform: uppercase;
+    padding: 3px 9px;
+    border-radius: 20px;
+  }
+  .badge.meeting { background: #e7f0ff; color: #2453c9; }
+  .badge.application { background: #fdeee0; color: #b5590c; }
+  .badge.form { background: #eaf6ea; color: #2a7a34; }
+  .badge.other { background: #f1eafd; color: #6a34c9; }
+
+  .card .subject { font-size: 13.5px; font-weight: 600; line-height: 1.3; }
+  .card .sender { font-size: 11.5px; color: #8a8a8a; }
+  .card .summary { font-size: 12.5px; color: #3c3c3c; line-height: 1.4; margin-top: 2px; }
+  .card .date { font-size: 10.5px; color: #a3a3a3; margin-top: auto; }
+
+  .card .actions { display: flex; gap: 8px; margin-top: 8px; }
+  .card .actions a, .card .actions button {
+    font-size: 11.5px;
+    padding: 6px 10px;
+    border-radius: 7px;
+    border: 1px solid #ddd9d2;
+    background: #fafaf9;
+    color: #333;
+    text-decoration: none;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .card .actions button.done { background: #1f1f1f; color: #fff; border-color: #1f1f1f; }
+
+  .empty, .loading, .error {
+    padding: 40px 10px;
+    text-align: center;
+    color: #7a7a7a;
+    font-size: 13.5px;
+  }
+  .error { color: #b5390c; }
+
+  .spinner {
+    width: 22px; height: 22px;
+    border: 3px solid #e0ddd6;
+    border-top-color: #2a2a28;
+    border-radius: 50%;
+    margin: 0 auto 12px;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<div class="top">
+  <h1>Action Items — Gmail</h1>
+</div>
+<div class="sub" id="subhead">Unread emails that need something from you.</div>
+
+<div id="app"></div>
+
+<script>
+/*
+ * TEMPLATE — before using this file, replace these three placeholders with the
+ * real, fully-qualified tool names for THIS user's Gmail connector (they are
+ * per-installation and will not match any name you've seen in a previous session):
+ *   __SEARCH_THREADS_TOOL__   - lists/searches threads by a Gmail-style query string
+ *   __GET_THREAD_TOOL__       - fetches one thread's full body
+ *   __UNLABEL_THREAD_TOOL__   - removes a label (e.g. UNREAD) from a thread
+ *
+ * This template also assumes the search tool's response looks roughly like:
+ *   { resultCountEstimate, nextPageToken, threads: [ { id, messages: [ { subject, sender, snippet, date, labelIds } ] } ] }
+ * and the thread-detail tool's response has messages[].plaintextBody.
+ * VERIFY this against a real call before trusting it — connector implementations vary
+ * in field names (e.g. maxResults vs pageSize, thread_id vs threadId). Adjust the
+ * parsing functions below (fetchUnreadThreads, threadToRecord, the recheck block in
+ * init) if the real shape differs.
+ */
+const SEARCH_THREADS_TOOL = '__SEARCH_THREADS_TOOL__';
+const GET_THREAD_TOOL = '__GET_THREAD_TOOL__';
+const UNLABEL_THREAD_TOOL = '__UNLABEL_THREAD_TOOL__';
+
+const DONE_KEY = 'gmail_action_items_done_v1';
+const CATS = {
+  meeting: 'Meetings & Scheduling',
+  application: 'Applications',
+  form: 'Forms & Questionnaires',
+  other: 'Other Actions'
+};
+let currentFilter = 'all';
+let allItems = []; // {id, subject, sender, snippet, date, category, summary}
+
+// Snippets from the search tool are short and can cut off before the actual ask.
+// These flag candidates for a full-body re-check even if the first pass said "not actionable".
+// See SKILL.md's note on the Sherut HaTaasuka bug for why this pass exists.
+const IMPORTANT_SENDER_RE = /\.gov\.il|\.ac\.il|taasuka|bituachleumi|misrad|\.edu$/i;
+const KEYWORD_RE = /(action required|please complete|questionnaire|survey|declare|deadline|required|פעול|טופס|הצהר|אישור|נדרש|יש לבצע|דחוף|לביצוע)/i;
+
+function getDoneSet() {
+  try { return new Set(JSON.parse(localStorage.getItem(DONE_KEY) || '[]')); }
+  catch (e) { return new Set(); }
+}
+function addDone(id) {
+  const s = getDoneSet();
+  s.add(id);
+  localStorage.setItem(DONE_KEY, JSON.stringify([...s]));
+}
+
+async function markRead(id, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Marking…'; }
+  try {
+    const r = await window.cowork.callMcpTool(UNLABEL_THREAD_TOOL, { threadId: id, labelIds: ['UNREAD'] });
+    if (r.isError) throw new Error(extractText(r) || 'Failed to mark as read');
+  } catch (e) {
+    alert('Could not mark as read: ' + (e.message || e));
+    if (btn) { btn.disabled = false; btn.textContent = 'Mark as read'; }
+    return;
+  }
+  addDone(id);
+  render();
+}
+window.markRead = markRead;
+
+async function markAllRead() {
+  const done = getDoneSet();
+  const visible = allItems.filter(it => it.actionable && !done.has(it.id));
+  const targets = currentFilter === 'all' ? visible : visible.filter(i => i.category === currentFilter);
+  if (targets.length === 0) return;
+  if (!confirm(`Mark ${targets.length} email${targets.length === 1 ? '' : 's'} as read in Gmail?`)) return;
+
+  const btn = document.querySelector('.mark-all');
+  if (btn) { btn.disabled = true; btn.textContent = `Marking ${targets.length}…`; }
+
+  let failed = 0;
+  for (const it of targets) {
+    try {
+      const r = await window.cowork.callMcpTool(UNLABEL_THREAD_TOOL, { threadId: it.id, labelIds: ['UNREAD'] });
+      if (r.isError) throw new Error('failed');
+      addDone(it.id);
+    } catch (e) {
+      failed++;
+    }
+  }
+  if (failed) alert(`Marked ${targets.length - failed} as read. ${failed} failed — try again.`);
+  render();
+}
+window.markAllRead = markAllRead;
+
+function extractText(res) {
+  if (!res) return '';
+  if (typeof res === 'string') return res;
+  if (typeof res.text === 'string') return res.text;
+  if (Array.isArray(res.content)) return res.content.map(c => c.text || '').join('\n');
+  if (typeof res.content === 'string') return res.content;
+  return JSON.stringify(res);
+}
+
+function parseJsonLoose(text) {
+  if (!text) return null;
+  let t = text.trim();
+  t = t.replace(/^```json/i, '').replace(/^```/, '').replace(/```$/, '').trim();
+  const start = t.indexOf('[');
+  const end = t.lastIndexOf(']');
+  if (start !== -1 && end !== -1 && end > start) t = t.substring(start, end + 1);
+  try { return JSON.parse(t); } catch (e) { return null; }
+}
+
+async function fetchUnreadThreads() {
+  let threads = [];
+  let pageToken = undefined;
+  let estimate = 0;
+  const MAX_PAGES = 2; // up to ~100 threads; raise if the user has a lot more and speed allows
+  for (let i = 0; i < MAX_PAGES; i++) {
+    const args = { query: 'is:unread', pageSize: 50, view: 'THREAD_VIEW_MINIMAL' };
+    if (pageToken) args.pageToken = pageToken;
+    const r = await window.cowork.callMcpTool(SEARCH_THREADS_TOOL, args);
+    if (r.isError) throw new Error(extractText(r) || 'search failed');
+    const data = r.structuredContent ?? JSON.parse(r.content[0].text);
+    estimate = Number(data.resultCountEstimate || data.threads?.length || 0);
+    threads = threads.concat(data.threads || []);
+    pageToken = data.nextPageToken;
+    if (!pageToken) break;
+  }
+  return { threads, estimate };
+}
+
+function threadToRecord(t) {
+  const msgs = t.messages || [];
+  const last = msgs[msgs.length - 1] || {};
+  return {
+    id: t.id,
+    subject: last.subject || '(no subject)',
+    sender: (last.sender || '').replace(/<.*?>/g, '').trim(),
+    snippet: (last.snippet || '').replace(/\s+/g, ' ').trim().slice(0, 300),
+    date: last.date || '',
+    important: msgs.some(m => (m.labelIds || []).includes('IMPORTANT'))
+  };
+}
+
+async function classifyBatch(records) {
+  const prompt = `You are triaging a batch of unread Gmail threads to find the ones that require the user to actually DO something: schedule/accept/respond to a meeting or call, submit or continue a job application, fill out a form/questionnaire/declaration, RSVP, sign/approve something, or reply because a person is waiting on an answer.
+
+Do NOT mark as actionable: newsletters, promotions/ads, generic job recommendation digests ("jobs for you", "apply to your saved jobs" batch emails) unless they name one specific role explicitly asking to apply now, automated receipts/invoices, security alerts with no action needed, notifications with no required response.
+
+For EACH item in the input array, return one object with these exact keys:
+- "id": copy the id field exactly
+- "actionable": true or false
+- "category": one of "meeting", "application", "form", "other" (only meaningful if actionable is true, otherwise use "other")
+- "summary": a short (<=12 words) sentence describing the specific action needed, empty string if not actionable
+
+Return ONLY a raw JSON array of these objects, one per input item, same order, no markdown fences, no commentary.`;
+  const res = await window.cowork.askClaude(prompt, records);
+  const text = extractText(res);
+  const parsed = parseJsonLoose(text);
+  return Array.isArray(parsed) ? parsed : [];
+}
+
+function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+function renderTabs(counts) {
+  const tabs = [['all', 'All', counts.all], ...Object.entries(CATS).map(([k, label]) => [k, label, counts[k] || 0])];
+  return `<div class="tabs">${tabs.map(([key, label, n]) =>
+    `<div class="tab ${currentFilter === key ? 'active' : ''}" onclick="setFilter('${key}')">${label} (${n})</div>`
+  ).join('')}</div>`;
+}
+
+function gmailLink(id) {
+  return `https://mail.google.com/mail/u/0/#all/${id}`;
+}
+
+function fmtDate(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  const now = new Date();
+  const sameDay = d.toDateString() === now.toDateString();
+  return sameDay
+    ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+
+function render() {
+  const done = getDoneSet();
+  const visible = allItems.filter(it => it.actionable && !done.has(it.id));
+  const counts = { all: visible.length };
+  Object.keys(CATS).forEach(k => counts[k] = visible.filter(i => i.category === k).length);
+
+  const shown = currentFilter === 'all' ? visible : visible.filter(i => i.category === currentFilter);
+  shown.sort((a, b) => new Date(b.date) - new Date(a.date));
+
+  const app = document.getElementById('app');
+  const toolbarHtml = `<div class="toolbar">
+    ${renderTabs(counts)}
+    <button class="mark-all" onclick="markAllRead()" ${shown.length === 0 ? 'disabled' : ''}>Mark all as read (${shown.length})</button>
+  </div>`;
+
+  if (shown.length === 0) {
+    app.innerHTML = toolbarHtml + `<div class="empty">Nothing here. ${visible.length === 0 ? "No unread emails currently need action." : "No items in this category."}</div>`;
+    return;
+  }
+
+  app.innerHTML = toolbarHtml + `<div class="board">${shown.map(it => `
+    <div class="card">
+      <div class="badge ${it.category}">${CATS[it.category] || 'Other'}</div>
+      <div class="subject">${escapeHtml(it.subject)}</div>
+      <div class="sender">${escapeHtml(it.sender)}</div>
+      <div class="summary">${escapeHtml(it.summary || '')}</div>
+      <div class="date">${fmtDate(it.date)}</div>
+      <div class="actions">
+        <a href="${gmailLink(it.id)}" target="_blank" rel="noopener">Open in Gmail</a>
+        <button class="done" onclick="markRead('${it.id}', this)">Mark as read</button>
+      </div>
+    </div>
+  `).join('')}</div>`;
+}
+
+function escapeHtml(s) {
+  return String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function setFilter(key) {
+  currentFilter = key;
+  render();
+}
+window.setFilter = setFilter;
+
+async function init() {
+  const app = document.getElementById('app');
+  app.innerHTML = `<div class="loading"><div class="spinner"></div>Scanning unread emails for action items…</div>`;
+  try {
+    const { threads, estimate } = await fetchUnreadThreads();
+    const records = threads.map(threadToRecord);
+
+    document.getElementById('subhead').textContent =
+      `Scanned ${records.length}${estimate > records.length ? ` of ~${estimate}` : ''} unread emails.`;
+
+    const batches = chunk(records, 20);
+    let results = [];
+    for (const b of batches) {
+      const classified = await classifyBatch(b);
+      results = results.concat(classified);
+    }
+
+    const byId = {};
+    results.forEach(r => { if (r && r.id) byId[r.id] = r; });
+
+    // Second pass: emails that looked non-actionable from the short snippet, but are
+    // flagged Important, from official/institutional senders, or contain action-hinting
+    // keywords, get re-checked against the full message body. See SKILL.md for why.
+    const RECHECK_CAP = 30;
+    const recheckCandidates = records.filter(rec => {
+      const c = byId[rec.id] || {};
+      if (c.actionable) return false;
+      return rec.important || IMPORTANT_SENDER_RE.test(rec.sender) ||
+        KEYWORD_RE.test(rec.subject) || KEYWORD_RE.test(rec.snippet);
+    }).slice(0, RECHECK_CAP);
+
+    const enrichedRecheck = [];
+    for (const rec of recheckCandidates) {
+      try {
+        const r = await window.cowork.callMcpTool(GET_THREAD_TOOL, { threadId: rec.id, messageFormat: 'FULL_CONTENT' });
+        if (r.isError) continue;
+        const data = r.structuredContent ?? JSON.parse(r.content[0].text);
+        const msgs = data.messages || [];
+        const last = msgs[msgs.length - 1] || {};
+        const bodyText = (last.plaintextBody || last.snippet || '').replace(/\s+/g, ' ').trim().slice(0, 1500);
+        enrichedRecheck.push({ id: rec.id, subject: rec.subject, sender: rec.sender, snippet: bodyText });
+      } catch (e) { /* skip on failure, keep original classification */ }
+    }
+
+    if (enrichedRecheck.length) {
+      const recheckBatches = chunk(enrichedRecheck, 10);
+      for (const b of recheckBatches) {
+        const reclassified = await classifyBatch(b);
+        reclassified.forEach(rc => { if (rc && rc.id) byId[rc.id] = rc; });
+      }
+    }
+
+    allItems = records.map(rec => {
+      const c = byId[rec.id] || {};
+      return {
+        ...rec,
+        actionable: !!c.actionable,
+        category: CATS[c.category] ? c.category : 'other',
+        summary: c.summary || ''
+      };
+    });
+
+    if (enrichedRecheck.length) {
+      document.getElementById('subhead').textContent +=
+        ` Double-checked ${enrichedRecheck.length} important/official email${enrichedRecheck.length === 1 ? '' : 's'} in full.`;
+    }
+
+    render();
+  } catch (e) {
+    app.innerHTML = `<div class="error">Couldn't load: ${escapeHtml(e.message || String(e))}. Use the Reload button above to try again.</div>`;
+  }
+}
+
+init();
+</script>
+</body>
+</html>
