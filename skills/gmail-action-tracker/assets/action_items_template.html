@@ -127,7 +127,7 @@
 <div class="top">
   <h1>Action Items — Gmail</h1>
 </div>
-<div class="sub" id="subhead">Unread emails that need something from you.</div>
+<div class="sub" id="subhead">Unread emails from the last 7 days that need something from you.</div>
 
 <div id="app"></div>
 
@@ -218,6 +218,37 @@ async function markAllRead() {
 }
 window.markAllRead = markAllRead;
 
+// Every external call (Gmail tool or AI triage) is wrapped in withTimeout so a genuine
+// hang surfaces as an error after N seconds instead of spinning forever. This was a
+// real bug: without it, a slow AI response left the page stuck on the loading spinner
+// with no feedback and no way to tell it apart from "broken."
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label} (>${Math.round(ms / 1000)}s)`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function setLoadingText(msg) {
+  const el = document.querySelector('.loading-text');
+  if (el) el.textContent = msg;
+}
+
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let idx = 0;
+  async function worker() {
+    while (idx < items.length) {
+      const current = idx++;
+      results[current] = await fn(items[current], current);
+    }
+  }
+  const workers = Array.from({ length: Math.min(limit, items.length) }, worker);
+  await Promise.all(workers);
+  return results;
+}
+
 function extractText(res) {
   if (!res) return '';
   if (typeof res === 'string') return res;
@@ -241,11 +272,16 @@ async function fetchUnreadThreads() {
   let threads = [];
   let pageToken = undefined;
   let estimate = 0;
-  const MAX_PAGES = 2; // up to ~100 threads; raise if the user has a lot more and speed allows
+  const MAX_PAGES = 2; // up to ~100 threads within the 7-day window
   for (let i = 0; i < MAX_PAGES; i++) {
-    const args = { query: 'is:unread', pageSize: 50, view: 'THREAD_VIEW_MINIMAL' };
+    // Scoped to the last 7 days, not all-time unread — an all-time query can run into
+    // the hundreds for an inbox that's been neglected, which is what actually caused
+    // the timeouts this was built to avoid. Widen this if the user wants more history
+    // and is fine with a slower load.
+    const args = { query: 'is:unread newer_than:7d', pageSize: 50, view: 'THREAD_VIEW_MINIMAL' };
     if (pageToken) args.pageToken = pageToken;
-    const r = await window.cowork.callMcpTool(SEARCH_THREADS_TOOL, args);
+    setLoadingText(threads.length ? `Fetching more unread emails… (${threads.length} so far)` : 'Fetching unread emails…');
+    const r = await withTimeout(window.cowork.callMcpTool(SEARCH_THREADS_TOOL, args), 30000, 'Gmail search');
     if (r.isError) throw new Error(extractText(r) || 'search failed');
     const data = r.structuredContent ?? JSON.parse(r.content[0].text);
     estimate = Number(data.resultCountEstimate || data.threads?.length || 0);
@@ -281,7 +317,7 @@ For EACH item in the input array, return one object with these exact keys:
 - "summary": a short (<=12 words) sentence describing the specific action needed, empty string if not actionable
 
 Return ONLY a raw JSON array of these objects, one per input item, same order, no markdown fences, no commentary.`;
-  const res = await window.cowork.askClaude(prompt, records);
+  const res = await withTimeout(window.cowork.askClaude(prompt, records), 45000, 'AI triage');
   const text = extractText(res);
   const parsed = parseJsonLoose(text);
   return Array.isArray(parsed) ? parsed : [];
@@ -362,54 +398,101 @@ window.setFilter = setFilter;
 
 async function init() {
   const app = document.getElementById('app');
-  app.innerHTML = `<div class="loading"><div class="spinner"></div>Scanning unread emails for action items…</div>`;
+  app.innerHTML = `<div class="loading"><div class="spinner"></div><span class="loading-text">Scanning unread emails for action items…</span></div>`;
+  const startTime = Date.now();
+  const SOFT_DEADLINE_MS = 45000; // once we're past this much elapsed time, skip the optional recheck pass and show what we have
+  let recheckSkipped = false;
   try {
     const { threads, estimate } = await fetchUnreadThreads();
     const records = threads.map(threadToRecord);
 
     document.getElementById('subhead').textContent =
-      `Scanned ${records.length}${estimate > records.length ? ` of ~${estimate}` : ''} unread emails.`;
+      `Scanned ${records.length}${estimate > records.length ? ` of ~${estimate}` : ''} unread emails from the last 7 days.`;
 
-    const batches = chunk(records, 20);
-    let results = [];
-    for (const b of batches) {
-      const classified = await classifyBatch(b);
-      results = results.concat(classified);
-    }
+    // Smaller batches classify faster and more reliably than a few big ones.
+    const batches = chunk(records, 12);
+    setLoadingText(`Triaging ${records.length} unread email${records.length === 1 ? '' : 's'}${batches.length > 1 ? ` (${batches.length} batches, running in parallel)` : ''}…`);
+    // Batches are independent and run concurrently. Each is wrapped so ONE slow/failed
+    // batch can't take the whole page down. IMPORTANT: on failure we do NOT silently
+    // treat those emails as "not actionable" (that would make them vanish with no
+    // indication) — instead they're flagged below as needing manual review. This is the
+    // second real bug this template has hit: a robustness fix that swallows failures
+    // silently just moves the bug from "crashes" to "quietly drops emails," which is
+    // worse because nothing looks wrong. When you can't tell if something is
+    // actionable, show it — don't guess "no."
+    let triageFailedIds = [];
+    const batchResults = await Promise.all(batches.map(async b => {
+      try { return await classifyBatch(b); }
+      catch (e) { triageFailedIds.push(...b.map(rec => rec.id)); return []; }
+    }));
+    const results = batchResults.flat();
 
     const byId = {};
     results.forEach(r => { if (r && r.id) byId[r.id] = r; });
+    triageFailedIds.forEach(id => {
+      if (!byId[id]) {
+        byId[id] = { id, actionable: true, category: 'other', summary: "Couldn't auto-triage this one (AI request failed) — check manually" };
+      }
+    });
 
     // Second pass: emails that looked non-actionable from the short snippet, but are
-    // flagged Important, from official/institutional senders, or contain action-hinting
-    // keywords, get re-checked against the full message body. See SKILL.md for why.
-    const RECHECK_CAP = 30;
-    const recheckCandidates = records.filter(rec => {
-      const c = byId[rec.id] || {};
-      if (c.actionable) return false;
-      return rec.important || IMPORTANT_SENDER_RE.test(rec.sender) ||
-        KEYWORD_RE.test(rec.subject) || KEYWORD_RE.test(rec.snippet);
-    }).slice(0, RECHECK_CAP);
+    // flagged Important by Gmail, from official/government senders, or contain
+    // action-hinting keywords, get re-checked against the full message body. This is
+    // "best effort" — if we're already running long, skip it rather than risk timing
+    // out entirely; the first-pass results still render.
+    const RECHECK_CAP = 15;
+    const recheckCandidates = (Date.now() - startTime > SOFT_DEADLINE_MS)
+      ? (recheckSkipped = true, [])
+      : records.filter(rec => {
+          const c = byId[rec.id] || {};
+          if (c.actionable) return false;
+          return rec.important || IMPORTANT_SENDER_RE.test(rec.sender) ||
+            KEYWORD_RE.test(rec.subject) || KEYWORD_RE.test(rec.snippet);
+        }).slice(0, RECHECK_CAP);
 
-    const enrichedRecheck = [];
-    for (const rec of recheckCandidates) {
-      try {
-        const r = await window.cowork.callMcpTool(GET_THREAD_TOOL, { threadId: rec.id, messageFormat: 'FULL_CONTENT' });
-        if (r.isError) continue;
-        const data = r.structuredContent ?? JSON.parse(r.content[0].text);
-        const msgs = data.messages || [];
-        const last = msgs[msgs.length - 1] || {};
-        const bodyText = (last.plaintextBody || last.snippet || '').replace(/\s+/g, ' ').trim().slice(0, 1500);
-        enrichedRecheck.push({ id: rec.id, subject: rec.subject, sender: rec.sender, snippet: bodyText });
-      } catch (e) { /* skip on failure, keep original classification */ }
-    }
+    let recheckDone = 0;
+    const fetchFailedIds = [];
+    const enrichedRecheckRaw = recheckCandidates.length
+      ? await mapWithConcurrency(recheckCandidates, 6, async (rec) => {
+          setLoadingText(`Double-checking important/official emails against full content… (${recheckDone}/${recheckCandidates.length})`);
+          try {
+            const r = await withTimeout(window.cowork.callMcpTool(GET_THREAD_TOOL, {
+              threadId: rec.id, messageFormat: 'FULL_CONTENT'
+            }), 15000, 'Gmail thread fetch');
+            recheckDone++;
+            if (r.isError) { fetchFailedIds.push(rec.id); return null; }
+            const data = r.structuredContent ?? JSON.parse(r.content[0].text);
+            const msgs = data.messages || [];
+            const last = msgs[msgs.length - 1] || {};
+            const bodyText = (last.plaintextBody || last.snippet || '').replace(/\s+/g, ' ').trim().slice(0, 1500);
+            return { id: rec.id, subject: rec.subject, sender: rec.sender, snippet: bodyText };
+          } catch (e) {
+            recheckDone++;
+            fetchFailedIds.push(rec.id);
+            return null;
+          }
+        })
+      : [];
+    // Same principle as above: we flagged these for a closer look precisely because
+    // the snippet might be hiding something. If we couldn't actually fetch the full
+    // body, don't silently trust the snippet-only "not actionable" verdict.
+    fetchFailedIds.forEach(id => {
+      byId[id] = { id, actionable: true, category: 'other', summary: "Flagged as possibly important but couldn't fetch full content — check manually" };
+    });
+    const enrichedRecheck = enrichedRecheckRaw.filter(Boolean);
 
     if (enrichedRecheck.length) {
       const recheckBatches = chunk(enrichedRecheck, 10);
-      for (const b of recheckBatches) {
-        const reclassified = await classifyBatch(b);
-        reclassified.forEach(rc => { if (rc && rc.id) byId[rc.id] = rc; });
-      }
+      setLoadingText(`Re-classifying ${enrichedRecheck.length} double-checked email${enrichedRecheck.length === 1 ? '' : 's'}…`);
+      let recheckFailedIds = [];
+      const recheckResults = await Promise.all(recheckBatches.map(async b => {
+        try { return await classifyBatch(b); }
+        catch (e) { recheckFailedIds.push(...b.map(rec => rec.id)); return []; }
+      }));
+      recheckResults.flat().forEach(rc => { if (rc && rc.id) byId[rc.id] = rc; });
+      recheckFailedIds.forEach(id => {
+        byId[id] = { id, actionable: true, category: 'other', summary: "Flagged for a closer look but re-classification failed — check manually" };
+      });
     }
 
     allItems = records.map(rec => {
@@ -425,6 +508,9 @@ async function init() {
     if (enrichedRecheck.length) {
       document.getElementById('subhead').textContent +=
         ` Double-checked ${enrichedRecheck.length} important/official email${enrichedRecheck.length === 1 ? '' : 's'} in full.`;
+    } else if (recheckSkipped) {
+      document.getElementById('subhead').textContent +=
+        ` Skipped the full-content double-check this time to keep things fast — reload if you want it re-run.`;
     }
 
     render();
