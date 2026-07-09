@@ -198,12 +198,18 @@ async function markAllRead() {
   const visible = allItems.filter(it => it.actionable && !done.has(it.id));
   const targets = currentFilter === 'all' ? visible : visible.filter(i => i.category === currentFilter);
   if (targets.length === 0) return;
-  if (!confirm(`Mark ${targets.length} email${targets.length === 1 ? '' : 's'} as read in Gmail?`)) return;
+  // Each email is a separate Gmail write action, so Cowork will ask you to approve
+  // each one individually (only the very first call in a batch carries the "real
+  // click" signal browsers use to allow write actions — there's no bulk/batch
+  // "mark read" API on the Gmail side to collapse these into one call). Saying so
+  // up front means the approval prompts read as expected, not as something broken.
+  if (!confirm(`Mark ${targets.length} email${targets.length === 1 ? '' : 's'} as read in Gmail?\n\nYou may be asked to approve each one individually — that's Cowork double-checking each write action, not a bug.`)) return;
 
   const btn = document.querySelector('.mark-all');
-  if (btn) { btn.disabled = true; btn.textContent = `Marking ${targets.length}…`; }
+  if (btn) { btn.disabled = true; btn.textContent = `Marking 0/${targets.length}…`; }
 
   let failed = 0;
+  let doneCount = 0;
   for (const it of targets) {
     try {
       const r = await window.cowork.callMcpTool(UNLABEL_THREAD_TOOL, { threadId: it.id, labelIds: ['UNREAD'] });
@@ -212,6 +218,8 @@ async function markAllRead() {
     } catch (e) {
       failed++;
     }
+    doneCount++;
+    if (btn) btn.textContent = `Marking ${doneCount}/${targets.length}…`;
   }
   if (failed) alert(`Marked ${targets.length - failed} as read. ${failed} failed — try again.`);
   render();

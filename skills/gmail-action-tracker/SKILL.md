@@ -64,6 +64,12 @@ The first fix for "stuck spinner" was to catch failures per-batch so one slow AI
 
 The template's actual behavior: when a triage or full-body-recheck call fails (timeout, error, whatever), the affected email is explicitly surfaced under "Other Actions" with a summary like "Couldn't auto-triage — check manually," instead of being marked not-actionable by default. The general principle, worth keeping whenever you touch this: **when you can't tell if something is actionable, show it — don't silently guess "no."** A false positive costs the user one glance at a card; a silent false negative costs them a missed action item and they won't even know to look.
 
+### The limitation you can't code around: per-call approval on bulk writes
+
+`markAllRead()` loops over every visible actionable email and calls the label-removal tool once per thread — there's no bulk "mark these N threads read" endpoint on the Gmail side to collapse that into one call. Cowork requires a genuine user gesture before letting an artifact call a data-modifying connector tool, and only the very first call in a loop carries that signal; every call after it looks, to the platform, indistinguishable from an artifact silently firing off writes on its own. So for N emails, expect up to N individual approval prompts.
+
+This is a deliberate safety boundary, not a bug, and there's no client-side trick that legitimately works around it (nor should there be — it's there to stop an artifact from mass-mutating a user's data without them noticing). The fix is honesty, not evasion: the confirm dialog before the loop starts says up front that each email may need its own approval, and the button shows live progress (`Marking 3/12…`) so the repeated prompts read as expected instead of looking broken. If a future connector exposes a real batch-modify tool, switch to that instead — one approval for one call, covering N emails, is strictly better than this workaround.
+
 ## Step 5: Publish
 
 Use `create_artifact` (or `update_artifact` if one already exists for this user), listing only the tool names you actually called and verified this session in `mcp_tools`. Give it a clear `id` and a `description` that says what it shows and where the data comes from.
