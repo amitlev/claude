@@ -316,7 +316,15 @@ function threadToRecord(t) {
 async function classifyBatch(records) {
   const prompt = `You are triaging a batch of unread Gmail threads to find the ones that require the user to actually DO something: schedule/accept/respond to a meeting or call, submit or continue a job application, fill out a form/questionnaire/declaration, RSVP, sign/approve something, or reply because a person is waiting on an answer.
 
-Do NOT mark as actionable: newsletters, promotions/ads, generic job recommendation digests ("jobs for you", "apply to your saved jobs" batch emails) unless they name one specific role explicitly asking to apply now, automated receipts/invoices, security alerts with no action needed, notifications with no required response.
+Do NOT mark as actionable: newsletters, promotions/ads, automated receipts/invoices, security alerts with no action needed, notifications with no required response.
+
+Be especially strict with automated emails from job-hunting sites (LinkedIn, Indeed, and similar). These platforms send a constant stream of algorithm-generated mail that LOOKS urgent but isn't. Treat as NOT actionable, no matter how the subject line is phrased:
+- Job recommendation / job alert digests ("jobs for you", "new jobs matching your search", "X is hiring")
+- "Apply now" / "quick apply" prompts for a role the user has not already started applying to ("your background could be a match", "apply to your saved jobs")
+- Confirmations that an application was already sent/received ("your application was sent to X", "we got it, thanks for applying")
+- Generic engagement bait (profile views, "people also viewed", premium upsells, connection digests)
+
+Only mark a job-site email as actionable if it requires a genuine next step FROM THE USER: a recruiter or hiring manager personally messaged them and is waiting on a reply, an interview needs to be scheduled/confirmed, an application has a next step the user must complete (e.g. an assessment or additional form), or similar. If you're not sure whether it's a real ask from a person versus an automated recommendation, treat it as NOT actionable — these platforms produce far more noise than signal.
 
 For EACH item in the input array, return one object with these exact keys:
 - "id": copy the id field exactly
